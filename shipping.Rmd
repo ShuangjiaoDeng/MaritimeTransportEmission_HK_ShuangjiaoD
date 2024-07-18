@@ -1,0 +1,468 @@
+---
+title: "Maritime Transport CO2 Emissions of Hong Kong - Analysis & Forecast R Code"
+author: "Shuangjiao Deng"
+date: "2024-05"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+library(pastecs)
+library(officer)
+library(flextable)
+library(zoo)
+library(fpp2)
+library(forecast)
+library(tidyverse)
+library(ggplot2)
+library(seastests)
+library(readxl)
+library(ggplot2)
+library(reshape2)
+library(caret)
+library(ggplot2)
+library(urca)
+library(vars)
+library(bestglm)
+library(tseries)
+```
+
+
+## Import Data & Processing
+
+```{r}
+df <- read_csv("C:/Users/NA/Downloads/HK_Emssion_2019-2023 - HK.csv", 
+               col_types = cols(NT_Passenger = col_double()))
+head(df)
+```
+### Descriptive Statistics
+
+```{r}
+# Get descriptive statistics result
+desc_stats <- stat.desc(df)
+
+print(desc_stats)
+
+# Get the result dataframe  and then save as docx file
+desc_stats_rounded <- round(desc_stats, 2) # round data for better display
+desc_stats_df <- as.data.frame(t(desc_stats_rounded))
+desc_stats_df$Index <- rownames(desc_stats_df) # set the variable names as index and rearrange it as the first col
+desc_stats_df <- desc_stats_df[, c(ncol(desc_stats_df), 1:(ncol(desc_stats_df) - 1))]
+# Output as docx
+doc <- read_docx()
+ft <- regulartable(desc_stats_df)
+doc <- body_add_flextable(doc, value = ft)
+print(doc, target = "desc_stats.docx")
+```
+
+
+
+### Handle dates and col names
+```{r}
+dates <- as.yearmon((2019 + seq(0,59)/12))
+df <- df %>%  mutate(Date = dates)
+df <- df[,-grep('Total',colnames(df))]
+names(df) <- gsub("/", "_", names(df))
+```
+
+### Check and Fill NAs
+```{r}
+# Check NAs in each cols
+colSums(is.na(df))
+
+```
+
+```{r}
+# Set target cols
+cols_to_fill <- c('Car_Carrier', 'Fishing_Fish_Processin_Vessel', "Pleasure_Vessel",'Roll_On_Roll_Off')
+window_size <- 3
+
+# Fill NAs with moving average
+for (col in cols_to_fill) {
+    na_index <- which(is.na(df[[col]]))
+    for (i in na_index) {
+      df[[col]][i] <- round(mean(df[[col]][(i-3):(i-1)], na.rm = TRUE))
+    
+  }
+}
+# The char in NT_Passenger is a sign of this value is lesser than 5. So I fill them with sampling between 1 and 5
+for (i in 1:60) {
+  if (is.na(df$NT_Passenger[i])) {
+    df$NT_Passenger[i] <- sample(1:5, 1)
+  }
+}
+
+```
+### Check correlation
+```{r}
+# Check only numeric variables
+num_cols <- sapply(df, is.numeric)
+num_df <- df[, num_cols]
+
+# Calculate correlations
+correlation <- cor(num_df)
+
+# Select variables using a threshold
+threshold <- 0.3
+high_corr_vars <- names(which(abs(correlation["Emissions", ]) > threshold))
+
+correlation_long <- melt(correlation)
+
+# Heatmap
+ggplot(data = correlation_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab",
+                       name="Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+                                   size = 10, hjust = 1)) +
+  coord_fixed()
+
+
+```
+```{r}
+# Print the variables having high correlation with Emissions
+print(high_corr_vars)
+```
+## Explore the seasonality of Emissions
+
+```{r}
+emission_ts <- ts(df$Emissions,frequency = 12,start = c(2019,1))
+emission_ts
+summary(emission_ts)
+autoplot(emission_ts)
+```
+
+```{r}
+# plot and test for seasonality
+ggseasonplot(emission_ts, 
+             year.labels=TRUE,
+             year.labels.left=TRUE,xlabs="DOW")+
+  ggtitle("Seasonal plot: emission")
+```
+
+```{r}
+ggseasonplot(emission_ts,polar=TRUE) +
+  ggtitle("Polar seasonal plot: emission")
+```
+
+
+```{r}
+ggsubseriesplot(emission_ts) +
+  ggtitle("Seasonal subseries plot: emission") +  theme(axis.text.x =element_blank())
+
+```
+
+
+```{r}
+isSeasonal(emission_ts)
+kw(emission_ts)
+```
+
+
+## Linear Regression Model
+
+### Set Month_Offset to capture trends
+```{r}
+baseline_date <- as.yearmon("Jan 2019")
+
+df$Month_Offset <- as.numeric(difftime(df$Date, baseline_date, units = "days")) / 30
+df <- df[,-grep('Date',colnames(df))]
+df <- df[, c(2:ncol(df), 1)]
+
+scaled_df <- as.data.frame(scale(df))
+scaled_df$Month_Offset <- df$Month_Offset
+```
+
+```{r}
+head(scaled_df)
+```
+### Split into train and test sets
+```{r}
+train_rows <- 54
+test_rows <- 6
+# Create indices for train and test sets
+train_indices <- seq_len(train_rows)
+test_indices <- seq(train_rows + 1, 60)
+```
+
+```{r}
+# Split the DataFrame into train and test sets
+train_df <- scaled_df[train_indices, ]
+test_df <- scaled_df[test_indices, ]
+```
+
+### Using bestglm to select variables for lm model
+```{r}
+lm_model <- bestglm(as.data.frame(scaled_df),IC='BIC')
+summary(lm_model)
+```
+
+```{r}
+# Extract the selected variables from the best model
+selected_vars <- names(coef(lm_model$BestModel))[-1]
+print(selected_vars)
+```
+### Fit lm using selected variables and month dummies
+```{r}
+# Fit a linear regression model using the selected variables
+# Add month dummy to capture the seasonal change
+months <- c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+train_df$Month_Dummy <- rep(months, length.out = nrow(train_df))
+lm <- lm(Emissions ~ ., data = train_df[, c("Emissions", selected_vars,'Month_Dummy')])
+summary(lm)
+```
+### Check Goodness
+```{r}
+# Predict using the linear regression model
+test_df$Month_Dummy <- months[7:12]
+predictions <- predict(lm, newdata = test_df)
+
+# Print R2
+print(predictions)
+R2(predictions,test_df$Emissions)
+```
+## VAR Model
+### Processing
+Check the selected_vars, deleted the Month_Offset and add some manually
+```{r}
+selected_vars
+selected_vars <- c(selected_vars[-length(selected_vars)])
+selected_vars <- c(selected_vars,c("Export","Cargo_Throughput","Pleasure_Vessel","Fishing_Fish_Processin_Vessel","Gas_Carrier_Tanker",'Emissions'))
+selected_vars
+```
+
+Check if differencing is needed
+Select the p of VAR
+```{r}
+ts_df <- ts(scaled_df[,selected_vars], start = c(2019, 1), frequency = 12)
+train_df <- ts_df[train_indices, ]
+test_df <- ts_df[test_indices, ]
+
+ndiffs(ts_df)
+
+VARselect(train_df,lag.max = 3)
+```
+### Variable selection
+```{r}
+var_model <- VAR(train_df, p = 1, type = "both")
+summary(var_model$varresult$Emissions)
+```
+```{r}
+# including dummy variables for months
+var_model <- VAR(train_df, p = 1, type = "both",season=12)
+summary(var_model$varresult$Emissions)
+```
+
+
+
+
+### Build VAR model
+```{r}
+selected_vars <- c("Export","Container_Throughput","Fishing_Fish_Processin_Vessel","NT_Passenger","Emissions")
+var_model <- VAR(train_df[,selected_vars], p = 1, type = "both",season = 12)
+summary(var_model$varresult$Emissions)
+```
+### Forecast
+```{r}
+pred_var <- predict(var_model,n.ahead=6)
+pred_var
+R2(pred_var$fcst$Emissions[,1],as.data.frame(test_df)$Emissions)
+```
+
+```{r}
+
+```
+
+## VECM Model
+
+```{r}
+new_df <- df[,selected_vars]
+```
+
+### Stationary
+```{r}
+# Adf test
+ts_df <- ts(scaled_df[,selected_vars], start = c(2019, 1), frequency = 12)
+adf_results <- apply(ts_df, 2, function(x) adf.test(x, alternative = "stationary"))
+print(adf_results)
+```
+
+```{r}
+#pp test
+pp_results <- apply(ts_df, 2, function(x) pp.test(x, alternative = "stationary"))
+print(pp_results)
+```
+
+
+
+
+differencing
+```{r}
+diff_ts_df <- diff(ts_df,1)
+# adf test
+adf_results <- apply(diff_ts_df, 2, function(x) adf.test(x, alternative = "stationary"))
+print(adf_results)
+
+```
+
+
+```{r}
+# pp test
+pp_results <- apply(diff_ts_df, 2, function(x) pp.test(x, alternative = "stationary"))
+print(pp_results)
+```
+### Build VECM model
+```{r}
+train_df <- diff_ts_df[train_indices, ]
+test_df <- diff_ts_df[test_indices[-6], ]
+```
+
+
+
+```{r}
+jo.dtdata <- ca.jo(train_df,type=c("trace"),ecdet = c("trend"),K=2,season=12)
+summary(jo.dtdata)
+```
+When r=0, we cannot reject the null hypothesis of no cointegration. It indicates the presence of cointegration in the data.
+We can reject r<=3 but can not reject r<=4 on 1pct. So r=4.
+
+
+```{r}
+vecm <- cajorls(jo.dtdata,r=4)
+summary(vecm$rlm)
+```
+### Forecast
+```{r}
+vecm_model <- vec2var(jo.dtdata)
+pred_vecm <- predict(vecm_model,n.ahead = 5)
+R2(pred_vecm$fcst$Emissions[,1],as.data.frame(test_df)$Emissions)
+```
+
+## Forecast with a final VECM model
+```{r}
+jo.dtdata <- ca.jo(diff_ts_df,type=c("trace"),ecdet = c("trend"),K=2,season=12)
+summary(jo.dtdata)
+```
+
+```{r}
+vecm <- cajorls(jo.dtdata,r=4)
+summary(vecm$rlm)
+```
+
+```{r}
+vecm_model <- vec2var(jo.dtdata)
+pred_diff_df <- predict(vecm_model,n.ahead = 7*12)
+print(pred_diff_df$fcst$Emissions)
+```
+
+### Plot the true value and forecast diff_value
+```{r}
+emissions <- as.vector(as.data.frame(diff_ts_df)$Emissions)
+pred <- as.vector(unlist(pred_diff_df$fcst$Emissions[,1]))
+emission_pred <- c(emissions,pred)
+
+fcst <- pred_diff_df$fcst$Emissions[, "fcst"]
+lower <- pred_diff_df$fcst$Emissions[, "lower"]
+upper <- pred_diff_df$fcst$Emissions[, "upper"]
+
+time_index <- as.yearmon((2024 + seq(0,83)/12))
+
+
+plot_data <- data.frame(Time = c(dates[-1],time_index),
+                        Emissions = c(as.data.frame(diff_ts_df)$Emissions, fcst),
+                        Lower = c(rep(NA, length(as.data.frame(diff_ts_df)$Emissions)), lower),
+                        Upper = c(rep(NA, length(as.data.frame(diff_ts_df)$Emissions)), upper),
+                        Type = c(rep("Actual", length(as.data.frame(diff_ts_df)$Emissions)), rep("Forecast", length(fcst))))
+# Plot
+ggplot(plot_data, aes(x = Time, y = Emissions, color = Type)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper, fill = Type), alpha = 0.2) +
+  labs(x = "Time", y = "Emissions", title = "Actual vs Forecast diff_Emissions") +
+  theme_minimal()
+```
+
+
+### De-differencing and plot
+```{r}
+de_diff_ts <- cumsum(emission_pred) + head(as.data.frame(ts_df)$Emissions, 1)
+de_diff_ts<- ts(de_diff_ts,frequency = 12,start = c(2019,2))
+autoplot(de_diff_ts)
+```
+
+### De-scaling and plot
+
+```{r}
+mean <- mean(df$Emissions)
+stdv <- sd(df$Emissions)
+recover_ts <- de_diff_ts * stdv + mean
+recover_ts <- as.data.frame(c(df$Emissions[1],recover_ts))
+names(recover_ts) <- c("Emission")
+recover_ts$Date <- c(dates,time_index)
+ggplot(recover_ts, aes(x = Date, y = Emission, color = "line")) +
+  geom_line() +
+  geom_line(data = recover_ts[60:nrow(recover_ts), ], aes(colour = "after_60")) +
+  labs(x = "Date", y = "Emission") +
+  theme_minimal() +
+  scale_color_manual(values = c("line" = "black", "after_60" = "blue"),
+                     labels = c("Emissions", "Forecast"))
+```
+### Print the forecast result
+```{r}
+print(tail(recover_ts, 7*12))
+```
+## IRF & Variance
+
+### irf
+```{r}
+irf <- irf(vecm_model,response='Emissions')
+irf
+```
+Plot
+```{r}
+par(mfrow=c(3,2),mar=c(2,2,2,3))
+for(i in 1:1)
+{
+p=vecm_model
+svec.irf <- irf(p,response='Emissions',boot=T)
+for(j in 1:5)
+{
+p=as.vector(svec.irf$irf[[j]])
+q=as.vector(svec.irf$Upper[[j]])
+k=as.vector(svec.irf$Lower[[j]])
+low=min(k)-0.1
+high=max(q)+0.1
+plot(p,type='l',main=paste(paste(svec.irf$response,'from'),svec.irf$impulse[j]),ylim=c(low,high))
+lines(q,type='l',lty=2,col='red')
+lines(k,type='l',lty=2,col='red')
+abline(h=0,col='red')
+}
+}
+```
+
+### Variance decomposition
+
+```{r}
+# Variance accounts for
+fevd<-fevd(vecm_model, n.ahead = 7*12)
+df <- data.frame(fevd$'Emissions')
+df['lag'] <- seq(1,84)
+
+y <- df[,1]
+x1 <- df[,2]
+x2 <- df[,3]
+x3 <- df[,4]
+x4 <- df[,5]
+lag <- df[,6]
+
+par(mfrow=c(2,3))
+plot(lag,y,type='l',col=1,ylab='VAF',main="Export")
+plot(lag,x1,type='l',col=1,,ylab='VAF',main='Container_Throughput')
+plot(lag,x2,type='l',col=1,ylab='VAF',main='Fishing_Vessel')
+plot(lag,x3,type='l',col=1,ylab='VAF',main='NT_Passenger')
+plot(lag,x4,type='l',col=1,ylab='VAF',main='Emissions')
+```
+
